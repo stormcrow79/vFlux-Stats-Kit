@@ -35,36 +35,83 @@
 [cmdletbinding()]
 param (
   [Parameter(Mandatory,HelpMessage='vCenter Name or IP Address')]
-  [string]$vCenter,
+  [string]$Computer,
   [array]$VMs,
-  [string]$InfluxDB,
-  [string]$InfluxURL = "http://localhost:8086"
-  [string]$InfluxUser = ""
+  [string]$InfluxDB = "perf_mdhbs_esx",
+  [string]$InfluxURL = "http://localhost:8086",
+  [string]$InfluxUser = "",
   [string]$InfluxPass = ""
 )
 
 Begin {
   ## stat preferences
-  $stat_id = "cpu.costop.summation","cpu.ready.summation","cpu.run.summation","cpu.wait.summation"
+  $stat_id = 
+    "cpu.costop.summation",
+    "cpu.ready.summation", 
+    "cpu.run.summation",
+    "cpu.wait.summation"
 
   ## Create the variables that we consume with Invoke-RestMethod later.
-  $authheader = 'Basic ' + ([Convert]::ToBase64String([Text.encoding]::ASCII.GetBytes(('{0}:{1}' -f $InfluxUser, $InfluxPass))))
+  #$authheader = 'Basic ' + ([Convert]::ToBase64String([Text.encoding]::ASCII.GetBytes(('{0}:{1}' -f $InfluxUser, $InfluxPass))))
   $uri = ('{0}/write?db={1}' -f $InfluxURL, $InfluxDB)
 
   Connect-VIServer -Server $Computer -WarningAction Continue -ErrorAction Stop
 }
 
 Process {
-# $vms = get-vm -name "karisma-interop"
-# $stat = get-stat -entity $vms -stat "cpu.ready.summation" -maxsamples 6 -realtime -instance "" | `
-#   select entity, timestamp, value, instance
-
-  $Entities = Get-VM -name $VMs| Where-Object {$_.PowerState -eq 'PoweredOn'} | Sort-Object -Property Name
-  foreach ($vm in $Entities) {
-    $stats = Get-Stat -Entity $vm -Stat $stat_id -RealTime -MaxSamples 1 -Instance ""
-    foreach ($stat in $stats) {
-
+  #Import PowerCLI module/snapin if needed
+  If(-Not(Get-Module -Name VMware.PowerCLI -ListAvailable -ErrorAction SilentlyContinue)){
+    $vMods = Get-Module -Name VMware.* -ListAvailable -Verbose:$false
+    If($vMods) {
+      foreach ($mod in $vMods) {
+        Import-Module -Name $mod -ErrorAction Stop -Verbose:$false
+      }
+      Write-Verbose -Message 'PowerCLI 6.x Module(s) imported.'
     }
+    Else {
+      If(!(Get-PSSnapin -Name VMware.VimAutomation.Core -ErrorAction SilentlyContinue)) {
+        Try {
+          Add-PSSnapin -Name VMware.VimAutomation.Core -ErrorAction Stop
+          Write-Verbose -Message 'PowerCLI 5.x Snapin added; recommend upgrading to PowerCLI 6.x'
+        }
+        Catch {
+          Write-Warning -Message 'Could not load PowerCLI'
+          Throw 'PowerCLI 5 or later required'
+        }
+      }
+    }
+  }
+
+  $run_freq_min = 1
+  $sample_count = ($run_freq_min * 60) / 20;
+
+  $Entities = Get-VM -Name $VMs | Where-Object PowerState -eq 'PoweredOn' | Sort-Object -Property Name
+  $stat = Get-Stat -Entity $Entities -Stat $stat_id -RealTime -MaxSamples $sample_count -Instance ""
+
+  $groups = $stat | Group-Object -Property Entity, Timestamp, IntervalSecs
+
+  foreach ($group in $groups) {
+    $vm = $group.Values[0]
+    $ts = $group.Values[1]
+    $int_s = $group.Values[2]
+
+    $line = "cpu,vm={0},int={1},cpu={2},ram={3} " -f $vm.Name, $int_s, $vm.NumCPU, $vm.MemoryGB
+
+    $metrics = $group.Group | Sort-Object -Property MetricId
+
+    foreach ($metric in $group.Group) {
+      $n = $metric.MetricId.Substring(4, $metric.MetricId.Length - ".summation".Length - 4)
+      $line += "{0}={1}i," -f $n, $metric.Value
+    }
+
+    if ($line.Length -gt 0) {
+      $line = $line.Substring(0, $line.Length - 1)
+    }
+
+    [long]$epoch_sec = ($ts-(Get-Date -Date '1/1/1970')).TotalSeconds #seconds since Unix epoch
+    $line += " " + $epoch_sec
+
+    Write-Host $line
   }
 }
 
